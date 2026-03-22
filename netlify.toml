@@ -1,9 +1,10 @@
 [build]
-  command = "npm run build"
+  command = "rm -rf node_modules && npm install --include=optional && npm run build"
   publish = "dist"
 
 [build.environment]
-  NODE_VERSION = "18"
+  NODE_VERSION = "20.19.0"
+  NPM_FLAGS = "--include=optional"
 
 [functions]
   directory = "netlify/functions"
