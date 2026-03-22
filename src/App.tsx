@@ -1,21 +1,27 @@
 import { useState, useEffect } from 'react';
 import { ImageUpload } from './components/ImageUpload';
-import type { WeekSheet } from './components/TimesheetForm';
+import type { WeekSheet, PageData, DayEntry } from './components/TimesheetForm';
 import { TimesheetForm } from './components/TimesheetForm';
 import { generatePDF } from './utils/pdfGenerator';
 import { parseTimesheet } from './utils/ocrParser';
-import { analyzeImage } from './utils/googleCloudOcr';
-import { FileText, RefreshCw, Wand2, Key, HelpCircle } from 'lucide-react';
+import { FileText, RefreshCw, Wand2, HelpCircle, LogIn, LogOut, Clock } from 'lucide-react';
 import { convertPdfToImage } from './utils/pdfToImage';
 import { HelpModal } from './components/HelpModal';
 import { TemplateModal } from './components/TemplateModal';
+import { AuthModal } from './components/AuthModal';
+import { SessionHistory } from './components/SessionHistory';
 import { Toast } from './components/Toast';
 import type { ToastMessage } from './components/Toast';
+import { useAuth } from './contexts/AuthContext';
+import { saveSession } from './services/sessionService';
+import { calculateDailyMinutes } from './utils/timeUtils';
+
+const DAYS = ['Saturday', 'Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday'];
 
 const createEmptyWeek = (): WeekSheet => ({
   employeeName: '',
   weekOf: '',
-  days: ['Saturday', 'Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday'].map(day => ({
+  days: DAYS.map(day => ({
     day,
     morningIn: '', morningOut: '',
     afternoonIn: '', afternoonOut: '',
@@ -23,15 +29,27 @@ const createEmptyWeek = (): WeekSheet => ({
   }))
 });
 
+const createEmptyPage = (n: number): PageData => ({
+  id: `page-${Date.now()}-${n}`,
+  label: `Page ${n}`,
+  week1: createEmptyWeek(),
+  week2: createEmptyWeek(),
+});
+
 function App() {
+  const { user, session: authSession, loading: authLoading, signOut } = useAuth();
+
   const [image, setImage] = useState<string | null>(null);
   const [fileName, setFileName] = useState<string>('');
-  const [apiKey, setApiKey] = useState('');
   const [isProcessing, setIsProcessing] = useState(false);
   const [showHelp, setShowHelp] = useState(false);
   const [showTemplateModal, setShowTemplateModal] = useState(false);
+  const [showAuth, setShowAuth] = useState(false);
+  const [showHistory, setShowHistory] = useState(false);
   const [manualMode, setManualMode] = useState(false);
-  const [data, setData] = useState({ week1: createEmptyWeek(), week2: createEmptyWeek() });
+  const [pages, setPages] = useState<PageData[]>([createEmptyPage(1)]);
+  const [currentPageIndex, setCurrentPageIndex] = useState(0);
+  const [hourlyRate, setHourlyRate] = useState('');
   const [ocrStatus, setOcrStatus] = useState('');
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
 
@@ -43,19 +61,25 @@ function App() {
     setToasts(prev => prev.filter(t => t.id !== id));
   };
 
+  // Deep link restore
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const dataParam = params.get('data');
     if (dataParam) {
       try {
         const decoded = JSON.parse(atob(dataParam));
-        if (decoded.week1 && decoded.week2) {
-          setData(decoded);
+        if (Array.isArray(decoded.pages)) {
+          setPages(decoded.pages);
+          if (decoded.hourlyRate) setHourlyRate(decoded.hourlyRate);
           setManualMode(true);
-          window.history.replaceState({}, '', window.location.pathname);
+        } else if (decoded.week1 && decoded.week2) {
+          setPages([{ id: 'page-legacy', label: 'Page 1', week1: decoded.week1, week2: decoded.week2 }]);
+          if (decoded.hourlyRate) setHourlyRate(decoded.hourlyRate);
+          setManualMode(true);
         }
+        window.history.replaceState({}, '', window.location.pathname);
       } catch (e) {
-        console.error("Failed to parse deep link data", e);
+        console.error('Failed to parse deep link data', e);
       }
     }
   }, []);
@@ -63,8 +87,9 @@ function App() {
   const runOCR = async (imageUrl?: string) => {
     const targetImage = imageUrl ?? image;
     if (!targetImage) return;
-    if (!apiKey) {
-      addToast('error', 'Please enter a Google Cloud Vision API Key first.');
+
+    if (!user || !authSession) {
+      addToast('error', 'Please sign in to use Auto-Fill (AI).');
       return;
     }
 
@@ -80,14 +105,33 @@ function App() {
         reader.readAsDataURL(blob);
       });
 
-      setOcrStatus('Sending to Google Cloud...');
-      const googleResponse = await analyzeImage(base64, apiKey);
+      setOcrStatus('Sending to server...');
+
+      // Use the secure proxy instead of calling Google directly
+      const proxyResponse = await fetch('/.netlify/functions/ocr-proxy', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${authSession.access_token}`,
+        },
+        body: JSON.stringify({ base64Image: base64 }),
+      });
+
+      if (!proxyResponse.ok) {
+        const errData = await proxyResponse.json().catch(() => ({}));
+        throw new Error(errData.error || `OCR failed (${proxyResponse.status})`);
+      }
+
+      const googleResponse = await proxyResponse.json();
 
       setOcrStatus('Processing structure...');
       const parsedData = parseTimesheet(googleResponse);
 
-      setData(parsedData);
-      console.log('Parsed Data:', parsedData);
+      setPages(prev => prev.map((page, idx) =>
+        idx === currentPageIndex
+          ? { ...page, week1: parsedData.week1, week2: parsedData.week2 }
+          : page
+      ));
       setOcrStatus('Done!');
     } catch (e: any) {
       console.error(e);
@@ -118,7 +162,7 @@ function App() {
     setImage(url);
     setFileName(finalFile.name);
 
-    if (apiKey) {
+    if (user && authSession) {
       runOCR(url);
     }
   };
@@ -128,8 +172,104 @@ function App() {
     setImage(null);
     setFileName('');
     setManualMode(false);
-    setData({ week1: createEmptyWeek(), week2: createEmptyWeek() });
+    setPages([createEmptyPage(1)]);
+    setCurrentPageIndex(0);
+    setHourlyRate('');
     setOcrStatus('');
+  };
+
+  const handleAddPage = () => {
+    const newPage = createEmptyPage(pages.length + 1);
+    setPages(prev => [...prev, newPage]);
+    setCurrentPageIndex(pages.length);
+  };
+
+  const handleDeletePage = (index: number) => {
+    if (pages.length <= 1) return;
+    setPages(prev => {
+      const updated = prev.filter((_, i) => i !== index).map((page, i) => ({
+        ...page,
+        label: `Page ${i + 1}`,
+      }));
+      return updated;
+    });
+    setCurrentPageIndex(prev => Math.min(prev, pages.length - 2));
+  };
+
+  const handleDayChange = (
+    pageIndex: number,
+    weekKey: 'week1' | 'week2',
+    dayIndex: number,
+    field: keyof DayEntry,
+    value: string
+  ) => {
+    setPages(prev => prev.map((page, pIdx) => {
+      if (pIdx !== pageIndex) return page;
+      const newDays = [...page[weekKey].days];
+      newDays[dayIndex] = { ...newDays[dayIndex], [field]: value };
+      return { ...page, [weekKey]: { ...page[weekKey], days: newDays } };
+    }));
+  };
+
+  const handleWeekChange = (
+    pageIndex: number,
+    weekKey: 'week1' | 'week2',
+    field: keyof WeekSheet,
+    value: string
+  ) => {
+    setPages(prev => prev.map((page, pIdx) => {
+      if (pIdx !== pageIndex) return page;
+      return { ...page, [weekKey]: { ...page[weekKey], [field]: value } };
+    }));
+  };
+
+  const handleSave = async () => {
+    generatePDF({ pages, hourlyRate });
+    addToast('success', 'PDF downloaded!');
+
+    // Save to database if authenticated
+    if (user) {
+      try {
+        const totalMins = pages.reduce((total, page) => {
+          const w1 = page.week1.days.reduce((acc, d) => acc + calculateDailyMinutes(d.morningIn, d.morningOut, d.afternoonIn, d.afternoonOut, '', ''), 0);
+          const w2 = page.week2.days.reduce((acc, d) => acc + calculateDailyMinutes(d.morningIn, d.morningOut, d.afternoonIn, d.afternoonOut, '', ''), 0);
+          return total + w1 + w2;
+        }, 0);
+        const totalHours = totalMins / 60;
+        const rate = parseFloat(hourlyRate || '0');
+        const totalPay = isNaN(rate) ? 0 : totalHours * rate;
+
+        const employeeName = pages[0]?.week1.employeeName || '';
+        const weekOf = pages[0]?.week1.weekOf || '';
+        const title = employeeName
+          ? `${employeeName}${weekOf ? ` - ${weekOf}` : ''}`
+          : `Session - ${new Date().toLocaleDateString()}`;
+
+        await saveSession({
+          title,
+          pages,
+          hourly_rate: hourlyRate || null,
+          total_hours: totalHours,
+          total_pay: totalPay,
+        });
+        addToast('success', 'Session saved to your account!');
+      } catch (e: any) {
+        console.error('Failed to save session:', e);
+        addToast('error', 'PDF downloaded but failed to save session.');
+      }
+    }
+  };
+
+  const handleLoadSession = (loadedPages: PageData[], loadedHourlyRate: string) => {
+    setPages(loadedPages);
+    setHourlyRate(loadedHourlyRate);
+    setCurrentPageIndex(0);
+    setManualMode(true);
+  };
+
+  const handleSignOut = async () => {
+    await signOut();
+    addToast('success', 'Signed out.');
   };
 
   return (
@@ -144,7 +284,7 @@ function App() {
           <p className="text-gray-400 text-sm">Digitize your handwritten timesheets instantly.</p>
         </div>
 
-        <div className="flex items-center gap-4">
+        <div className="flex items-center gap-3">
           <button
             onClick={() => setShowHelp(true)}
             className="flex items-center gap-2 px-4 py-2 bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded-lg text-sm text-gray-300 hover:text-white transition-colors"
@@ -153,27 +293,47 @@ function App() {
             How to Use
           </button>
 
-          {(image || manualMode) && (
-            <div className="flex items-center gap-4">
-              {image && (
-                <div className="flex items-center bg-gray-800 rounded-lg border border-gray-700 px-3 py-1">
-                  <Key className="w-4 h-4 text-gray-400 mr-2" />
-                  <input
-                    type="password"
-                    placeholder="Google Vision API Key"
-                    value={apiKey}
-                    onChange={(e) => setApiKey(e.target.value)}
-                    className="bg-transparent border-none outline-none text-sm text-white w-48 placeholder-gray-500"
-                  />
-                </div>
-              )}
+          {/* Auth buttons */}
+          {!authLoading && (
+            user ? (
+              <div className="flex items-center gap-3">
+                <button
+                  onClick={() => setShowHistory(true)}
+                  className="flex items-center gap-2 px-3 py-2 bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded-lg text-sm text-gray-300 hover:text-white transition-colors"
+                  title="View saved sessions"
+                >
+                  <Clock className="w-4 h-4" />
+                  History
+                </button>
+                <span className="text-xs text-gray-400 hidden md:block max-w-[120px] truncate" title={user.email}>
+                  {user.email}
+                </span>
+                <button
+                  onClick={handleSignOut}
+                  className="flex items-center gap-1.5 px-3 py-2 bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded-lg text-sm text-gray-400 hover:text-red-400 transition-colors"
+                >
+                  <LogOut className="w-4 h-4" />
+                  Sign Out
+                </button>
+              </div>
+            ) : (
               <button
-                onClick={handleStartOver}
-                className="text-sm text-gray-400 hover:text-red-400 border border-gray-700 hover:border-red-500 px-3 py-1.5 rounded-lg transition-colors"
+                onClick={() => setShowAuth(true)}
+                className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded-lg text-sm text-white transition-colors"
               >
-                Start Over
+                <LogIn className="w-4 h-4" />
+                Sign In
               </button>
-            </div>
+            )
+          )}
+
+          {(image || manualMode) && (
+            <button
+              onClick={handleStartOver}
+              className="text-sm text-gray-400 hover:text-red-400 border border-gray-700 hover:border-red-500 px-3 py-1.5 rounded-lg transition-colors"
+            >
+              Start Over
+            </button>
           )}
         </div>
       </header>
@@ -205,7 +365,8 @@ function App() {
                 </div>
                 <button
                   onClick={() => runOCR()}
-                  disabled={isProcessing}
+                  disabled={isProcessing || !user}
+                  title={!user ? 'Sign in to use Auto-Fill' : ''}
                   className="bg-purple-600 hover:bg-purple-700 text-white px-3 py-1 rounded text-sm flex items-center gap-2 transition-colors disabled:opacity-50"
                 >
                   {isProcessing ? <RefreshCw className="w-3 h-3 animate-spin" /> : <Wand2 className="w-3 h-3" />}
@@ -213,10 +374,13 @@ function App() {
                 </button>
               </div>
 
-              {!apiKey && !isProcessing && (
+              {!user && !isProcessing && (
                 <div className="bg-yellow-500/10 border border-yellow-500/40 text-yellow-300 text-xs px-3 py-2 rounded-lg mb-3 flex items-center gap-2">
-                  <Key className="w-3.5 h-3.5 flex-shrink-0" />
-                  Enter your API key in the header, then click "Auto-Fill (AI)"
+                  <LogIn className="w-3.5 h-3.5 flex-shrink-0" />
+                  <span>
+                    <button onClick={() => setShowAuth(true)} className="underline hover:text-yellow-200">Sign in</button>
+                    {' '}to use Auto-Fill (AI) — your API key is stored securely on the server.
+                  </span>
                 </div>
               )}
 
@@ -233,11 +397,16 @@ function App() {
             <div className="bg-white rounded-xl shadow-2xl h-[80vh] overflow-y-auto">
               <div className="p-6">
                 <TimesheetForm
-                  initialData={data}
-                  onSave={(currentData) => {
-                    generatePDF(currentData);
-                    addToast('success', 'PDF downloaded successfully!');
-                  }}
+                  pages={pages}
+                  currentPageIndex={currentPageIndex}
+                  hourlyRate={hourlyRate}
+                  onPageChange={setCurrentPageIndex}
+                  onAddPage={handleAddPage}
+                  onDeletePage={handleDeletePage}
+                  onDayChange={handleDayChange}
+                  onWeekChange={handleWeekChange}
+                  onHourlyRateChange={setHourlyRate}
+                  onSave={handleSave}
                 />
                 <div className="h-20" />
               </div>
@@ -259,6 +428,13 @@ function App() {
 
       {showHelp && <HelpModal onClose={() => setShowHelp(false)} />}
       {showTemplateModal && <TemplateModal onClose={() => setShowTemplateModal(false)} />}
+      {showAuth && <AuthModal onClose={() => setShowAuth(false)} />}
+      {showHistory && (
+        <SessionHistory
+          onLoadSession={handleLoadSession}
+          onClose={() => setShowHistory(false)}
+        />
+      )}
     </div>
   );
 }

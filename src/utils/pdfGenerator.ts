@@ -1,24 +1,19 @@
 import jsPDF from 'jspdf';
 import autoTable from 'jspdf-autotable';
-import type { WeekSheet } from '../components/TimesheetForm';
+import type { WeekSheet, PageData } from '../components/TimesheetForm';
 import { calculateDailyMinutes, formatMinutes } from './timeUtils';
 
-// Helper to draw the table structure
-const drawWeekTable = (doc: jsPDF, week: WeekSheet | null, startY: number) => {
-    // Header Info
-
+// Helper to draw a single week table, returns the Y position after the table
+const drawWeekTable = (doc: jsPDF, week: WeekSheet | null, startY: number): number => {
     doc.setFontSize(10);
-    doc.setTextColor(0, 0, 0); // Force Black Text
-    // Draw Boxes for Name and Week Of like in image
-    // Name Box
+    doc.setTextColor(0, 0, 0);
+
     doc.rect(14, startY, 90, 10);
-    doc.text(week ? `Name Of Employee: ${week.employeeName}` : "Name Of Employee:", 16, startY + 7);
+    doc.text(week ? `Name Of Employee: ${week.employeeName}` : 'Name Of Employee:', 16, startY + 7);
 
-    // Week Of Box
     doc.rect(104, startY, 90, 10);
-    doc.text(week ? `Week Of: ${week.weekOf}` : "Week Of:", 106, startY + 7);
+    doc.text(week ? `Week Of: ${week.weekOf}` : 'Week Of:', 106, startY + 7);
 
-    // Prepare Body
     let body: any[] = [];
     if (week) {
         body = week.days.map(day => {
@@ -43,7 +38,6 @@ const drawWeekTable = (doc: jsPDF, week: WeekSheet | null, startY: number) => {
 
         body.push(['Total Hours', '', '', '', '', formatMinutes(totalWeeklyMinutes)]);
     } else {
-        // Blank rows for template
         const DAYS = ['Saturday', 'Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday'];
         body = DAYS.map(day => [day, '', '', '', '', '']);
         body.push(['Total Hours', '', '', '', '', '']);
@@ -58,13 +52,11 @@ const drawWeekTable = (doc: jsPDF, week: WeekSheet | null, startY: number) => {
                 { content: 'Afternoon', colSpan: 2, styles: { halign: 'center' } },
                 { content: 'Daily', rowSpan: 2, styles: { valign: 'middle', halign: 'center' } }
             ],
-            [
-                'In', 'Out', 'In', 'Out', 'Total'
-            ]
+            ['In', 'Out', 'In', 'Out', 'Total']
         ],
-        body: body,
+        body,
         theme: 'grid',
-        styles: { lineWidth: 0.1, lineColor: [0, 0, 0], minCellHeight: 8 }, // Taller cells for writing
+        styles: { lineWidth: 0.1, lineColor: [0, 0, 0], minCellHeight: 8 },
         headStyles: { fillColor: [255, 255, 255], textColor: [0, 0, 0], fontStyle: 'bold' },
         columnStyles: {
             0: { fontStyle: 'bold', cellWidth: 25 },
@@ -74,57 +66,139 @@ const drawWeekTable = (doc: jsPDF, week: WeekSheet | null, startY: number) => {
     return (doc as any).lastAutoTable.finalY;
 };
 
-export function generatePDF(data: { week1: WeekSheet; week2: WeekSheet; hourlyRate?: string }) {
+export function generatePDF({ pages, hourlyRate }: { pages: PageData[]; hourlyRate?: string }) {
     const doc = new jsPDF();
-    doc.setFontSize(18);
-    doc.setFont('helvetica', 'bold');
-    doc.text("Bi-weekly Time Sheet", 105, 15, { align: "center" });
 
-    let currentY = 25;
-    currentY = drawWeekTable(doc, data.week1, currentY);
-    currentY += 10;
-    currentY = drawWeekTable(doc, data.week2, currentY);
+    let grandTotalMins = 0;
 
-    // Calculate Totals for PDF
-    const w1Mins = data.week1.days.reduce((acc, d) => acc + calculateDailyMinutes(d.morningIn, d.morningOut, d.afternoonIn, d.afternoonOut, '', ''), 0);
-    const w2Mins = data.week2.days.reduce((acc, d) => acc + calculateDailyMinutes(d.morningIn, d.morningOut, d.afternoonIn, d.afternoonOut, '', ''), 0);
-    const totalMins = w1Mins + w2Mins;
-    const totalHours = totalMins / 60;
-    const rate = parseFloat(data.hourlyRate || '0');
+    pages.forEach((page, pageIndex) => {
+        if (pageIndex > 0) {
+            doc.addPage();
+        }
+
+        doc.setFontSize(18);
+        doc.setFont('helvetica', 'bold');
+        const title = pages.length > 1
+            ? `Bi-weekly Time Sheet — ${page.label}`
+            : 'Bi-weekly Time Sheet';
+        doc.text(title, 105, 15, { align: 'center' });
+
+        let currentY = 25;
+        currentY = drawWeekTable(doc, page.week1, currentY);
+        currentY += 10;
+        currentY = drawWeekTable(doc, page.week2, currentY);
+
+        // Per-page subtotal
+        const w1Mins = page.week1.days.reduce((acc, d) => acc + calculateDailyMinutes(d.morningIn, d.morningOut, d.afternoonIn, d.afternoonOut, '', ''), 0);
+        const w2Mins = page.week2.days.reduce((acc, d) => acc + calculateDailyMinutes(d.morningIn, d.morningOut, d.afternoonIn, d.afternoonOut, '', ''), 0);
+        const pageTotalMins = w1Mins + w2Mins;
+        grandTotalMins += pageTotalMins;
+
+        currentY += 10;
+
+        // Per-page summary box
+        doc.setDrawColor(0);
+        doc.setFillColor(245, 245, 245);
+        doc.rect(14, currentY, 180, 20, 'F');
+        doc.rect(14, currentY, 180, 20, 'S');
+
+        doc.setFontSize(10);
+        doc.setFont('helvetica', 'bold');
+        doc.text(`Page Hours: ${formatMinutes(pageTotalMins)}`, 20, currentY + 12);
+
+        if (pages.length > 1) {
+            doc.setFont('helvetica', 'normal');
+            doc.setFontSize(9);
+            doc.text('(See last page for grand total)', 105, currentY + 12, { align: 'center' });
+        }
+    });
+
+    // Grand total summary — on last page (or same page if single)
+    const rate = parseFloat(hourlyRate || '0');
+    const totalHours = grandTotalMins / 60;
     const totalPay = isNaN(rate) ? 0 : totalHours * rate;
 
-    currentY += 10;
+    // Add a fresh page for grand total only when there are multiple pages
+    if (pages.length > 1) {
+        doc.addPage();
+        doc.setFontSize(16);
+        doc.setFont('helvetica', 'bold');
+        doc.text('Grand Total Summary', 105, 20, { align: 'center' });
 
-    // Summary Box
-    doc.setDrawColor(0);
-    doc.setFillColor(245, 245, 245);
-    doc.rect(14, currentY, 180, 25, 'F');
-    doc.rect(14, currentY, 180, 25, 'S');
+        // Per-page breakdown table
+        const breakdownBody = pages.map(page => {
+            const w1 = page.week1.days.reduce((acc, d) => acc + calculateDailyMinutes(d.morningIn, d.morningOut, d.afternoonIn, d.afternoonOut, '', ''), 0);
+            const w2 = page.week2.days.reduce((acc, d) => acc + calculateDailyMinutes(d.morningIn, d.morningOut, d.afternoonIn, d.afternoonOut, '', ''), 0);
+            const pageMins = w1 + w2;
+            const pageHours = pageMins / 60;
+            const pagePay = isNaN(rate) ? 0 : pageHours * rate;
+            return [
+                page.label,
+                page.week1.employeeName || '—',
+                formatMinutes(pageMins),
+                rate > 0 ? `$${pagePay.toFixed(2)}` : '—'
+            ];
+        });
 
-    doc.setFontSize(11);
-    doc.setFont('helvetica', 'bold');
+        autoTable(doc, {
+            startY: 30,
+            head: [['Page', 'Employee', 'Hours', 'Pay']],
+            body: breakdownBody,
+            theme: 'grid',
+            styles: { lineWidth: 0.1, lineColor: [0, 0, 0] },
+            headStyles: { fillColor: [240, 240, 240], textColor: [0, 0, 0], fontStyle: 'bold' },
+        });
 
-    // Column 1: Hours
-    doc.text("Total Hours:", 20, currentY + 10);
-    doc.setFont('helvetica', 'normal');
-    doc.text(formatMinutes(totalMins), 20, currentY + 18);
+        const afterTable = (doc as any).lastAutoTable.finalY + 10;
 
-    // Column 2: Rate
-    doc.setFont('helvetica', 'bold');
-    doc.text("Hourly Rate:", 80, currentY + 10);
-    doc.setFont('helvetica', 'normal');
-    doc.text(rate > 0 ? `$${rate.toFixed(2)}` : '-', 80, currentY + 18);
+        // Grand total box
+        doc.setDrawColor(0);
+        doc.setFillColor(230, 245, 230);
+        doc.rect(14, afterTable, 180, 30, 'F');
+        doc.rect(14, afterTable, 180, 30, 'S');
 
-    // Column 3: Total Pay
-    doc.setFont('helvetica', 'bold');
-    doc.text("Total Pay:", 140, currentY + 10);
-    doc.setFontSize(14); // Larger for pay
-    doc.text(rate > 0 ? `$${totalPay.toFixed(2)}` : '-', 140, currentY + 18);
+        doc.setFontSize(11);
+        doc.setFont('helvetica', 'bold');
+        doc.text('Grand Total Hours:', 20, afterTable + 12);
+        doc.setFont('helvetica', 'normal');
+        doc.text(formatMinutes(grandTotalMins), 20, afterTable + 22);
 
+        doc.setFont('helvetica', 'bold');
+        doc.text('Hourly Rate:', 80, afterTable + 12);
+        doc.setFont('helvetica', 'normal');
+        doc.text(rate > 0 ? `$${rate.toFixed(2)}` : '—', 80, afterTable + 22);
 
+        doc.setFont('helvetica', 'bold');
+        doc.text('Total Pay:', 140, afterTable + 12);
+        doc.setFontSize(14);
+        doc.text(rate > 0 ? `$${totalPay.toFixed(2)}` : '—', 140, afterTable + 22);
+    } else {
+        // Single page — append summary at bottom of the only page (same as original)
+        // Re-calculate currentY based on last page content
+        // We don't have access to currentY here, so we use a fixed offset approach via lastAutoTable
+        const lastY = (doc as any).lastAutoTable.finalY + 20;
 
+        doc.setDrawColor(0);
+        doc.setFillColor(245, 245, 245);
+        doc.rect(14, lastY, 180, 25, 'F');
+        doc.rect(14, lastY, 180, 25, 'S');
 
-    doc.save("timesheet.pdf");
+        doc.setFontSize(11);
+        doc.setFont('helvetica', 'bold');
+        doc.text('Total Hours:', 20, lastY + 10);
+        doc.setFont('helvetica', 'normal');
+        doc.text(formatMinutes(grandTotalMins), 20, lastY + 18);
+
+        doc.setFont('helvetica', 'bold');
+        doc.text('Hourly Rate:', 80, lastY + 10);
+        doc.setFont('helvetica', 'normal');
+        doc.text(rate > 0 ? `$${rate.toFixed(2)}` : '-', 80, lastY + 18);
+
+        doc.setFont('helvetica', 'bold');
+        doc.text('Total Pay:', 140, lastY + 10);
+        doc.setFontSize(14);
+        doc.text(rate > 0 ? `$${totalPay.toFixed(2)}` : '-', 140, lastY + 18);
+    }
+
+    doc.save('timesheet.pdf');
 }
-
-
